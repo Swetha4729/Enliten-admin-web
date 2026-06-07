@@ -5,7 +5,8 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
 const { parseOffice } = require('officeparser');
-
+const IS_LOCAL_LLM = true;
+const LLM_BASE_URL = IS_LOCAL_LLM ? 'http://127.0.0.1:11434/v1' : 'https://openrouter.ai/api/v1';
 // ═══════════════════════════════════════════════════════════════
 //  Tool Definitions — UUID-free, model-friendly
 // ═══════════════════════════════════════════════════════════════
@@ -402,6 +403,7 @@ async function executeTool(
           note: "This search was processed, continue answering the student's question based on the web results provided in your context."
         });
       }
+
       default:
         console.warn(`[TOOL] Unknown tool: ${toolName}`);
         return JSON.stringify({ error: `Unknown tool: ${toolName}` });
@@ -410,6 +412,58 @@ async function executeTool(
     console.error(`[TOOL] Exception in ${toolName}:`, err);
     return JSON.stringify({ error: `Tool execution failed: ${err.message}` });
   }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Image URL Validator — strips hallucinated image URLs
+// ═══════════════════════════════════════════════════════════════
+async function validateImageUrls(text: string): Promise<{ cleaned: string; removed: number }> {
+  const imageMarkdownRegex = /!\[([^\]]*)\]\((https?:\/\/[^)]+)\)/g;
+  const matches: { full: string; url: string }[] = [];
+  let match;
+  while ((match = imageMarkdownRegex.exec(text)) !== null) {
+    matches.push({ full: match[0], url: match[2] });
+  }
+
+  if (matches.length === 0) return { cleaned: text, removed: 0 };
+
+  console.log(`[IMG_VALIDATE] Found ${matches.length} image(s) to validate`);
+
+  const results = await Promise.allSettled(
+    matches.map(async (m) => {
+      try {
+        const resp = await fetch(m.url, {
+          method: 'HEAD',
+          signal: AbortSignal.timeout(3000),
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EnlitenBot/1.0)' },
+          redirect: 'follow',
+        });
+        const contentType = resp.headers.get('content-type') || '';
+        const isValid = resp.ok && contentType.startsWith('image/');
+        console.log(`[IMG_VALIDATE] ${m.url} → ${resp.status} (${contentType}) → ${isValid ? 'VALID' : 'INVALID'}`);
+        return { ...m, valid: isValid };
+      } catch (err: any) {
+        console.log(`[IMG_VALIDATE] ${m.url} → FAILED (${err.message})`);
+        return { ...m, valid: false };
+      }
+    })
+  );
+
+  let cleaned = text;
+  let removed = 0;
+  for (const r of results) {
+    if (r.status === 'fulfilled' && !r.value.valid) {
+      // Remove the invalid image markdown entirely (including any surrounding blank lines)
+      cleaned = cleaned.replace(r.value.full, '');
+      removed++;
+    }
+  }
+
+  // Clean up leftover double blank lines from removed images
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+
+  console.log(`[IMG_VALIDATE] Result: ${matches.length - removed} valid, ${removed} removed`);
+  return { cleaned, removed };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -478,10 +532,12 @@ export default async function handler(req: any, res: any) {
   // attachments: [{ url, name, type, size, storage_path }]
   const validAttachments: any[] = Array.isArray(attachments) ? attachments.filter((a: any) => a && a.url && a.type) : [];
 
-  // const OLLAMA_MODEL = 'qwen3:4b-instruct-2507-q4_K_M';
-  const OLLAMA_MODEL = 'google/gemini-3-flash-preview'
-  // const openai = new OpenAI({ baseURL: 'http://127.0.0.1:11434/v1', apiKey: 'ollama' }); sk-cv-bdccdc6877c24f558a2e9e10a60ad6f0
-  const openai = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: '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' });
+  const OLLAMA_MODEL = 'qwen3:4b-instruct-2507-q4_K_M';
+  // const OLLAMA_MODEL = 'google/gemini-3-flash-preview'
+  // const openai = new OpenAI({ baseURL: 'http://127.0.0.1:11434/v1', apiKey: 'ollama' });
+  const openai = new OpenAI({ baseURL: LLM_BASE_URL, apiKey: IS_LOCAL_LLM ? 'ollama' : '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' });
+  // sk - cv - bdccdc6877c24f558a2e9e10a60ad6f0
+  // const openai = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: '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' });
 
   //groq = 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
   //openadaptor = sk-cv-bdccdc6877c24f558a2e9e10a60ad6f0
@@ -510,7 +566,7 @@ export default async function handler(req: any, res: any) {
       let title = 'Untitled';
       try {
         const titleRes = await openai.chat.completions.create({
-          model: 'google/gemini-2.5-flash-lite',
+          model: IS_LOCAL_LLM ? OLLAMA_MODEL : 'google/gemini-2.5-flash-lite',
           messages: [
             { role: 'system', content: 'Generate a concise 3-4 word title. Return ONLY the title that suite for this conversation.' },
             { role: 'user', content: message }
@@ -847,7 +903,12 @@ CURRENT AFFAIRS & LIVE DATA RULE:
     • New government scheme names, budget figures, welfare program details
     • Current year statistics (GDP, poverty rate, census data)
     • Any fact that changes year-to-year
-  After searching, cite: "(Source: TNPSC Official / The Hindu, [date])"
+  After searching, cite sources naturally inline as markdown links.
+  Format: [source name](URL) — use the actual URLs from the search results provided to you.
+  Example: [The Hindu](https://www.thehindu.com/news/national/article12345.ece)
+  CRITICAL: Only use URLs that were returned by the web search tool. NEVER fabricate, guess, or construct URLs from memory. If you don't have a real URL from search results, omit the link rather than inventing one.
+  Place all source links at the END of your response under a "**Sources:**" heading.
+  Never omit the URLs — the app renders them as clickable source buttons for the student.
   Never state current affairs facts from training memory alone.
 </tool_protocol>
 
@@ -866,6 +927,17 @@ FORMATTING RULES:
   • > Blockquotes — Thirukkural lines, Preamble text, important constitutional phrases
   • Numbered lists — sequences, steps, chronological orders
   • Bullet points — non-sequential lists, features, comparisons
+  • Images — You MAY include relevant images using markdown: ![description](url)
+    Proactively include images when they genuinely enhance understanding — do NOT wait for the student to ask:
+    ✓ Scientific diagrams (human heart, solar system, cell structure)
+    ✓ Maps when discussing Tamil Nadu geography, rivers, districts
+    ✓ Historical photos or illustrations for national movement events
+    ✓ Infographics for economic data, government schemes
+    RULES:
+    - ONLY use image URLs that appear in web search results returned to you. Copy the exact URL from the search results.
+    - NEVER construct, guess, or modify image URLs. Do not try to build Wikipedia Commons thumbnail URLs from memory.
+    - If no image URL was returned in search results, do NOT include any images — skip them entirely.
+    - The server validates all image URLs. Invalid ones are automatically stripped, so fabricated URLs will simply disappear.
   • Avoid over-formatting simple responses — a direct fact question gets a direct sentence answer
 
 HEADING STRUCTURE:
@@ -953,6 +1025,7 @@ STUDENT WELLBEING:
     const MAX_TOOL_ROUNDS = 3;
     let messages: any[] = [{ role: 'system', content: TNPSC_SYSTEM_PROMPT }, ...chatMessages];
     let fullText = '';
+    let streamAnnotations: any[] = [];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       const isToolRound = round < MAX_TOOL_ROUNDS;
@@ -960,7 +1033,7 @@ STUDENT WELLBEING:
       console.log(`[STREAM] Round ${round}, tools=${isToolRound}`);
 
       const stream = await openai.chat.completions.create({
-        model: OLLAMA_MODEL,
+        model: IS_LOCAL_LLM ? OLLAMA_MODEL : 'google/gemini-3-flash-preview',
         messages,
         ...(isToolRound ? { tools: MENTOR_TOOLS } : {}),
         stream: true,
@@ -969,8 +1042,19 @@ STUDENT WELLBEING:
       let toolCalls: any[] = [];
 
       for await (const chunk of stream) {
+
         const delta = chunk.choices[0]?.delta;
         if (!delta) continue;
+
+        // Capture annotations from streaming chunks (OpenRouter sends url_citation here)
+        if ((delta as any).annotations) {
+          streamAnnotations.push(...(delta as any).annotations);
+        }
+        // Also check for annotations at the choice level (some models attach them on final chunk)
+        const choiceAny = chunk.choices[0] as any;
+        if (choiceAny?.annotations) {
+          streamAnnotations.push(...choiceAny.annotations);
+        }
 
         if (delta.tool_calls) {
           accumulateToolCalls(toolCalls, delta);
@@ -985,7 +1069,7 @@ STUDENT WELLBEING:
 
       // If no tool calls, the model produced its final text — break
       if (toolCalls.length === 0) {
-        console.log(`[STREAM] Round ${round} — no tool calls, done.`);
+        console.log(`[STREAM] Round ${round} — no tool calls, done. Annotations collected: ${streamAnnotations.length}`);
         break;
       }
 
@@ -1010,14 +1094,84 @@ STUDENT WELLBEING:
     }
 
     // Strip <think> tags for storage
-    const cleanText = fullText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+    let cleanText = fullText.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+    // Validate image URLs — strip hallucinated/broken ones
+    const { cleaned: validatedText, removed: removedImageCount } = await validateImageUrls(cleanText);
+    if (removedImageCount > 0) {
+      console.log(`[IMG_VALIDATE] Stripped ${removedImageCount} invalid image(s) from response`);
+      cleanText = validatedText;
+      // Send correction event so client can replace streamed text with validated version
+      res.write(`data: ${JSON.stringify({ type: 'text_correction', content: cleanText })}\n\n`);
+    }
+
+    // DEBUG: Log the response text to see if model includes markdown links
+    console.log(`[DEBUG] cleanText (first 500 chars):`, cleanText.substring(0, 500));
+    console.log(`[DEBUG] fullText length: ${fullText.length}, cleanText length: ${cleanText.length}`);
+    const debugLinks = cleanText.match(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g);
+    console.log(`[DEBUG] Markdown links found:`, debugLinks || 'NONE');
+
+    // --- Extract sources: prefer OpenRouter annotations, fallback to markdown links ---
+    let dbSources: any = null;
+    const seenUrls = new Set<string>();
+    const groundingChunks: any[] = [];
+
+    // 1. Primary: Use OpenRouter url_citation annotations (verified, real URLs)
+    if (streamAnnotations.length > 0) {
+      console.log(`[SOURCES] Found ${streamAnnotations.length} annotation(s) from OpenRouter`);
+      for (const ann of streamAnnotations) {
+        if (ann.type === 'url_citation' && ann.url_citation?.url) {
+          const url = ann.url_citation.url;
+          if (seenUrls.has(url)) continue;
+          seenUrls.add(url);
+          let title = ann.url_citation.title || '';
+          try {
+            const hostname = new URL(url).hostname.replace('www.', '');
+            if (!title || title.startsWith('http') || title.length > 60) {
+              title = hostname;
+            }
+          } catch (e) { }
+          groundingChunks.push({
+            web: { uri: url, title }
+          });
+        }
+      }
+    }
+
+    // 2. Fallback: Parse markdown links from the response text
+    //    (only if no annotations were found — annotations are more reliable)
+    if (groundingChunks.length === 0) {
+      const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+      let linkMatch;
+      while ((linkMatch = markdownLinkRegex.exec(cleanText)) !== null) {
+        const [, linkText, url] = linkMatch;
+        if (seenUrls.has(url)) continue;
+        seenUrls.add(url);
+        let title = linkText;
+        try {
+          const hostname = new URL(url).hostname.replace('www.', '');
+          if (title.startsWith('http') || title.length > 60) {
+            title = hostname;
+          }
+        } catch (e) { }
+        groundingChunks.push({
+          web: { uri: url, title }
+        });
+      }
+    }
+
+    if (groundingChunks.length > 0) {
+      dbSources = { groundingChunks };
+      console.log(`[SOURCES] Final: ${groundingChunks.length} citation(s) extracted`);
+    }
+    // ------------------------------------------------------------------
 
     // Generate follow-up questions (non-streaming)
     let followUpQuestions: string[] = [];
     try {
       res.write(`data: ${JSON.stringify({ type: 'status', status: 'Generating follow-ups...' })}\n\n`);
       const fqRes = await openai.chat.completions.create({
-        model: 'google/gemini-3.1-flash-lite',
+        model: IS_LOCAL_LLM ? OLLAMA_MODEL : 'google/gemini-3.1-flash-lite',
         messages: [
           ...chatMessages,
           { role: 'assistant', content: cleanText },
@@ -1036,7 +1190,7 @@ STUDENT WELLBEING:
     // Save AI message to DB
     const { data: aiMsgData } = await supabase
       .from('ai_chat_messages')
-      .insert([{ thread_id: currentThreadId, sender: 'ai', text: cleanText, sources: null, follow_up_questions: followUpQuestions, attachments: null }])
+      .insert([{ thread_id: currentThreadId, sender: 'ai', text: cleanText, sources: dbSources, follow_up_questions: followUpQuestions, attachments: null }])
       .select().single();
 
     // Send final done event
